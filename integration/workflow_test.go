@@ -176,6 +176,83 @@ func TestWorkloadPlanReplayIsScopedAndExact(t *testing.T) {
 	}
 }
 
+func TestFreezeStaysAtomicWhenAuditFails(t *testing.T) {
+	environment := newEnvironment(t)
+	fixture := environment.settledWorkload(t)
+	ctx := context.Background()
+
+	batch, _, err := environment.meterings.Create(ctx, environment.steward, fixture.plan.Workload.ID, "freeze-batch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := environment.meterings.Claim(ctx, environment.reviewer, batch.ID, "freeze-claim")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range claim.Items {
+		if _, err := environment.meterings.Record(ctx, environment.reviewer, batch.ID, claim.Batch.LeaseToken, item.ID, "grasp", `{"quality":"accepted"}`, "freeze-item", item.Version); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := environment.meterings.Submit(ctx, environment.reviewer, batch.ID, claim.Batch.LeaseToken, "freeze-submit"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := environment.meterings.Review(ctx, environment.steward, batch.ID, "freeze-review", true, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	draft, err := environment.ledgers.Create(ctx, environment.steward, "Frozen Audit Lab", "freeze-create")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if draft, _, err = environment.ledgers.AddWorkloads(ctx, environment.steward, draft.ID, "freeze-items", []string{fixture.plan.Workload.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := environment.database.SQL().Exec(`
+		CREATE TRIGGER fail_freeze_audit BEFORE INSERT ON audit_events
+		WHEN NEW.action = 'ledger.freeze'
+		BEGIN SELECT RAISE(ABORT, 'forced audit failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := environment.ledgers.Freeze(ctx, environment.steward, draft.ID, "freeze-fail"); err == nil {
+		t.Fatal("freeze unexpectedly succeeded while audit insert failed")
+	}
+	leaked, _, err := environment.ledgers.Get(ctx, environment.steward, draft.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if leaked.Status != domain.LedgerStatusDraft || leaked.Digest != "" || leaked.FrozenAt != nil || leaked.Version != draft.Version {
+		t.Fatalf("failed freeze leaked state: %+v", leaked)
+	}
+	var freezeEvents int
+	if err := environment.database.SQL().QueryRow(`SELECT COUNT(*) FROM outbox_events WHERE topic = 'ledger.freeze'`).Scan(&freezeEvents); err != nil {
+		t.Fatal(err)
+	}
+	if freezeEvents != 0 {
+		t.Fatalf("failed freeze leaked %d outbox events", freezeEvents)
+	}
+	if _, err := environment.database.SQL().Exec(`DROP TRIGGER fail_freeze_audit`); err != nil {
+		t.Fatal(err)
+	}
+	frozen, err := environment.ledgers.Freeze(ctx, environment.steward, draft.ID, "freeze-retry")
+	if err != nil {
+		t.Fatalf("retry freeze after fault cleared: %v", err)
+	}
+	if frozen.Status != domain.LedgerStatusFrozen || len(frozen.Digest) != 64 || frozen.FrozenAt == nil {
+		t.Fatalf("unexpected frozen ledger after retry: %+v", frozen)
+	}
+	var auditCount, outboxCount int
+	if err := environment.database.SQL().QueryRow(`SELECT COUNT(*) FROM audit_events WHERE action = 'ledger.freeze' AND object_id = ?`, draft.ID).Scan(&auditCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := environment.database.SQL().QueryRow(`SELECT COUNT(*) FROM outbox_events WHERE topic = 'ledger.freeze' AND aggregate_id = ?`, draft.ID).Scan(&outboxCount); err != nil {
+		t.Fatal(err)
+	}
+	if auditCount != 1 || outboxCount != 1 {
+		t.Fatalf("retry freeze produced audit=%d outbox=%d, want 1/1", auditCount, outboxCount)
+	}
+}
+
 func TestAuditFailureRollsBackWorkloadTransition(t *testing.T) {
 	environment := newEnvironment(t)
 	ctx := context.Background()

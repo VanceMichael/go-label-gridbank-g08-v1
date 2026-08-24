@@ -142,16 +142,14 @@ func (s *Service) Freeze(ctx context.Context, principal auth.Principal, ledgerID
 		if err := s.repo.Transition(ctx, tx, principal.TenantID, ledgerID, draft.Status, domain.LedgerStatusFrozen, draft.Version, digest, now); err != nil {
 			return err
 		}
+		if err := s.appendEffects(ctx, tx, principal, requestID, "ledger.freeze", ledgerID, "frozen", now); err != nil {
+			return err
+		}
 		draft.Status, draft.Digest, draft.FrozenAt, draft.UpdatedAt, draft.Version = domain.LedgerStatusFrozen, digest, &now, now, draft.Version+1
 		frozen = draft
 		return nil
 	})
 	if err != nil {
-		return domain.LedgerDraft{}, fmt.Errorf("freeze ledger: %w", err)
-	}
-	if err := s.db.Write(ctx, func(tx *sql.Tx) error {
-		return s.appendEffects(ctx, tx, principal, requestID, "ledger.freeze", ledgerID, "frozen", now)
-	}); err != nil {
 		return domain.LedgerDraft{}, fmt.Errorf("freeze ledger: %w", err)
 	}
 	return frozen, nil
