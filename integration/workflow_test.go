@@ -220,6 +220,37 @@ func TestAuditFailureRollsBackWorkloadTransition(t *testing.T) {
 	}
 }
 
+func TestAuditFailureRollsBackProviderRegistration(t *testing.T) {
+	environment := newEnvironment(t)
+	ctx := context.Background()
+	if _, err := environment.database.SQL().Exec(`
+		CREATE TRIGGER fail_provider_audit BEFORE INSERT ON audit_events
+		WHEN NEW.action = 'provider.create'
+		BEGIN SELECT RAISE(ABORT, 'forced audit failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := environment.providers.CreateProvider(ctx, environment.admin, "Leak Lab", "UTC", "leak-provider"); err == nil {
+		t.Fatal("create provider unexpectedly succeeded while audit insert failed")
+	}
+	var providerCount int
+	if err := environment.database.SQL().QueryRow(`SELECT COUNT(*) FROM providers WHERE tenant_id = ? AND name = ?`, environment.admin.TenantID, "Leak Lab").Scan(&providerCount); err != nil {
+		t.Fatal(err)
+	}
+	if providerCount != 0 {
+		t.Fatalf("failed registration leaked %d providers", providerCount)
+	}
+	if _, err := environment.database.SQL().Exec(`DROP TRIGGER fail_provider_audit`); err != nil {
+		t.Fatal(err)
+	}
+	provider, err := environment.providers.CreateProvider(ctx, environment.admin, "Leak Lab", "UTC", "leak-provider-retry")
+	if err != nil {
+		t.Fatalf("retry after audit failure = %v, want success", err)
+	}
+	if provider.Name != "Leak Lab" {
+		t.Fatalf("retry provider name = %q, want %q", provider.Name, "Leak Lab")
+	}
+}
+
 func TestCanceledContextCannotStartWorkload(t *testing.T) {
 	environment := newEnvironment(t)
 	ctx := context.Background()

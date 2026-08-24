@@ -53,13 +53,9 @@ func (s *Service) CreateProvider(ctx context.Context, principal auth.Principal, 
 		if err := s.repo.InsertProvider(ctx, tx, value); err != nil {
 			return err
 		}
-		return nil
+		return s.audits.Append(ctx, tx, audit.Record{ID: auditID, TenantID: principal.TenantID, ActorID: principal.UserID, Action: "provider.create", ObjectType: "provider", ObjectID: value.ID, Outcome: "created", RequestID: requestID, CreatedAt: now})
 	}); err != nil {
 		return domain.Provider{}, fmt.Errorf("create provider: %w", err)
-	}
-	returnValue := s.audits.Append(ctx, s.db.SQL(), audit.Record{ID: auditID, TenantID: principal.TenantID, ActorID: principal.UserID, Action: "provider.create", ObjectType: "provider", ObjectID: value.ID, Outcome: "created", RequestID: requestID, CreatedAt: now})
-	if returnValue != nil {
-		return domain.Provider{}, fmt.Errorf("create provider audit: %w", returnValue)
 	}
 	return value, nil
 }
