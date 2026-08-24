@@ -128,15 +128,14 @@ func (s *Service) Reserve(ctx context.Context, principal auth.Principal, account
 		}
 		account.Held += amount
 		account.UpdatedAt, account.Version = now, account.Version+1
-		return nil
+		// Audit the hold in the same transaction as the balance mutation so
+		// that an audit-store failure rolls back the reservation. Writing the
+		// effect separately would leave an orphaned hold on the account while
+		// returning failure, which blocks idempotent retries of the same job.
+		return s.creditEffects(ctx, tx, principal, requestID, "credit.reserve", workloadID, "held", now)
 	})
 	if err != nil {
 		return domain.CreditAccount{}, fmt.Errorf("reserve credits: %w", err)
-	}
-	if err := s.db.Write(ctx, func(tx *sql.Tx) error {
-		return s.creditEffects(ctx, tx, principal, requestID, "credit.reserve", workloadID, "held", now)
-	}); err != nil {
-		return domain.CreditAccount{}, fmt.Errorf("reserve credit audit: %w", err)
 	}
 	return account, nil
 }
