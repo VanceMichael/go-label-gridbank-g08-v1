@@ -220,6 +220,87 @@ func TestAuditFailureRollsBackWorkloadTransition(t *testing.T) {
 	}
 }
 
+func TestCancelPreservesLeaseWhenAuditRejectsEvent(t *testing.T) {
+	environment := newEnvironment(t)
+	ctx := context.Background()
+	providerValue, err := environment.providers.CreateProvider(ctx, environment.admin, "Cancel Lab", "UTC", "cancel-provider")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool, err := environment.providers.CreatePool(ctx, environment.admin, providerValue.ID, "Cancel Pool", domain.CapabilityGPU, "cancel-pool")
+	if err != nil {
+		t.Fatal(err)
+	}
+	capacity_offer, err := environment.providers.CreateCapacityOffer(ctx, environment.admin, "Cancel Pose", "factory", domain.CapabilityGPU, "cancel-capacity_offer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := environment.workloads.Plan(ctx, environment.operator, workload.PlanInput{ProviderID: providerValue.ID, CapacityOfferID: capacity_offer.ID, PoolID: pool.ID, ReservationRef: "consent", IdempotencyKey: "cancel-plan", RequestID: "cancel-plan"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaseBeforeID, leaseBeforeVersion, err := activeLeaseState(environment, plan.Lease.PoolID)
+	if err != nil {
+		t.Fatalf("locate active lease before cancel: %v", err)
+	}
+	if _, err := environment.database.SQL().Exec(`
+		CREATE TRIGGER fail_cancel_audit BEFORE INSERT ON audit_events
+		WHEN NEW.action = 'workload.cancel'
+		BEGIN SELECT RAISE(ABORT, 'forced audit failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := environment.workloads.Cancel(ctx, environment.operator, plan.Workload.ID, "cancel-attempt"); err == nil {
+		t.Fatal("cancel unexpectedly succeeded while audit insert failed")
+	}
+	current, err := environment.workloads.Get(ctx, environment.operator, plan.Workload.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Status != domain.WorkloadQueued || current.Version != plan.Workload.Version {
+		t.Fatalf("failed cancel leaked workload state: %+v", current)
+	}
+	leaseAfterID, leaseAfterVersion, err := activeLeaseState(environment, plan.Lease.PoolID)
+	if err != nil {
+		t.Fatalf("active lease vanished after failed cancel: %v", err)
+	}
+	if leaseAfterID != leaseBeforeID || leaseAfterVersion != leaseBeforeVersion {
+		t.Fatalf("failed cancel released or changed the pool lease: id=%s version=%d", leaseAfterID, leaseAfterVersion)
+	}
+	var canceledEvents int
+	if err := environment.database.SQL().QueryRow(`SELECT COUNT(*) FROM outbox_events WHERE topic = 'workload.cancel'`).Scan(&canceledEvents); err != nil {
+		t.Fatal(err)
+	}
+	if canceledEvents != 0 {
+		t.Fatalf("failed cancel leaked %d outbox events", canceledEvents)
+	}
+	if _, err := environment.database.SQL().Exec(`DROP TRIGGER fail_cancel_audit`); err != nil {
+		t.Fatal(err)
+	}
+	canceled, err := environment.workloads.Cancel(ctx, environment.operator, plan.Workload.ID, "cancel-retry")
+	if err != nil {
+		t.Fatalf("cancel retry after audit recovery failed: %v", err)
+	}
+	if canceled.Status != domain.WorkloadCanceled || canceled.CanceledAt == nil {
+		t.Fatalf("retry did not cancel the workload: %+v", canceled)
+	}
+	if _, _, err := activeLeaseState(environment, plan.Lease.PoolID); !errors.Is(err, domain.ErrNotFound) {
+		t.Fatalf("retry did not release the pool lease: %v", err)
+	}
+}
+
+func activeLeaseState(environment *testEnvironment, poolID string) (string, int64, error) {
+	var id string
+	var version int64
+	err := environment.database.SQL().QueryRow(`SELECT id, version FROM leases WHERE tenant_id = ? AND pool_id = ? AND released_at IS NULL`, environment.admin.TenantID, poolID).Scan(&id, &version)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", 0, domain.NotFound("test.active_lease", "pool_lease", poolID)
+	}
+	if err != nil {
+		return "", 0, err
+	}
+	return id, version, nil
+}
+
 func TestCanceledContextCannotStartWorkload(t *testing.T) {
 	environment := newEnvironment(t)
 	ctx := context.Background()

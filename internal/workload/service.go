@@ -226,32 +226,8 @@ func (s *Service) Cancel(ctx context.Context, principal auth.Principal, workload
 		return domain.WorkloadSession{}, err
 	}
 	now := s.clock.Now()
-	current, err := s.repo.Find(ctx, s.db.SQL(), principal.TenantID, workloadID)
-	if err != nil {
-		return domain.WorkloadSession{}, fmt.Errorf("cancel workload: %w", err)
-	}
-	if err := current.Status.Transition(domain.WorkloadCanceled); err != nil {
-		return domain.WorkloadSession{}, fmt.Errorf("cancel workload: %w", err)
-	}
-	if principal.Role == domain.RoleOperator && current.OperatorID != principal.UserID {
-		return domain.WorkloadSession{}, fmt.Errorf("cancel workload: %w", domain.Wrap(domain.ErrForbidden, "workload.cancel", "workload_session", workloadID, "operator does not own workload", nil))
-	}
-	lease, leaseErr := s.providers.FindActiveLease(ctx, s.db.SQL(), principal.TenantID, current.PoolID)
-	if leaseErr != nil && !errors.Is(leaseErr, domain.ErrNotFound) {
-		return domain.WorkloadSession{}, fmt.Errorf("cancel workload: %w", leaseErr)
-	}
-	if leaseErr == nil {
-		if lease.WorkloadID != workloadID {
-			return domain.WorkloadSession{}, fmt.Errorf("cancel workload: %w", domain.Conflict("workload.cancel", "workload_session", workloadID, "pool lease belongs to another workload"))
-		}
-		if err := s.db.Write(ctx, func(tx *sql.Tx) error {
-			return s.providers.ReleaseLease(ctx, tx, principal.TenantID, lease.ID, lease.Owner, lease.Token, lease.Version, now)
-		}); err != nil {
-			return domain.WorkloadSession{}, fmt.Errorf("cancel workload: %w", err)
-		}
-	}
 	var updated domain.WorkloadSession
-	err = s.db.Write(ctx, func(tx *sql.Tx) error {
+	err := s.db.Write(ctx, func(tx *sql.Tx) error {
 		current, err := s.repo.Find(ctx, tx, principal.TenantID, workloadID)
 		if err != nil {
 			return err
@@ -261,6 +237,23 @@ func (s *Service) Cancel(ctx context.Context, principal auth.Principal, workload
 		}
 		if principal.Role == domain.RoleOperator && current.OperatorID != principal.UserID {
 			return domain.Wrap(domain.ErrForbidden, "workload.cancel", "workload_session", workloadID, "operator does not own workload", nil)
+		}
+		// Release the live pool lease in the same transaction as the status
+		// transition and audit append. If the audit insert is rejected, the
+		// lease release rolls back too, so the workload status and lease
+		// ownership can never diverge; once the audit dependency recovers the
+		// cancel can be retried while the lease is still held.
+		lease, leaseErr := s.providers.FindActiveLease(ctx, tx, principal.TenantID, current.PoolID)
+		if leaseErr != nil && !errors.Is(leaseErr, domain.ErrNotFound) {
+			return leaseErr
+		}
+		if leaseErr == nil {
+			if lease.WorkloadID != workloadID {
+				return domain.Conflict("workload.cancel", "workload_session", workloadID, "pool lease belongs to another workload")
+			}
+			if err := s.providers.ReleaseLease(ctx, tx, principal.TenantID, lease.ID, lease.Owner, lease.Token, lease.Version, now); err != nil {
+				return err
+			}
 		}
 		if err := s.repo.Transition(ctx, tx, principal.TenantID, workloadID, current.Status, domain.WorkloadCanceled, current.Version, now, TransitionTimes{CanceledAt: &now}); err != nil {
 			return err
