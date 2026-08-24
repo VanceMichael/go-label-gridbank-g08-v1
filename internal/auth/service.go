@@ -202,7 +202,7 @@ func (s *Service) Logout(ctx context.Context, principal Principal, requestID str
 		return err
 	}
 	now := s.clock.Now()
-	if err := s.db.Write(ctx, func(tx *sql.Tx) error {
+	return s.db.Write(ctx, func(tx *sql.Tx) error {
 		var version int64
 		var revoked sql.NullString
 		err := tx.QueryRowContext(ctx, `SELECT version, revoked_at FROM auth_sessions WHERE tenant_id = ? AND id = ?`, principal.TenantID, principal.SessionID).Scan(&version, &revoked)
@@ -213,16 +213,17 @@ func (s *Service) Logout(ctx context.Context, principal Principal, requestID str
 			return fmt.Errorf("load session for logout: %w", err)
 		}
 		if revoked.Valid {
+			// The session is already revoked, so the audit trail was written by the
+			// logout that performed the revocation. Treat a retry as a success rather
+			// than appending a duplicate audit record or surfacing an error that
+			// would leave the operator unable to confirm the logout completed.
 			return nil
 		}
 		if err := s.repo.RevokeSession(ctx, tx, principal.TenantID, principal.SessionID, version, now); err != nil {
 			return err
 		}
-		return nil
-	}); err != nil {
-		return err
-	}
-	return s.audits.Append(ctx, s.db.SQL(), audit.Record{ID: auditID, TenantID: principal.TenantID, ActorID: principal.UserID, Action: "auth.logout", ObjectType: "auth_session", ObjectID: principal.SessionID, Outcome: "revoked", RequestID: requestID, CreatedAt: now})
+		return s.audits.Append(ctx, tx, audit.Record{ID: auditID, TenantID: principal.TenantID, ActorID: principal.UserID, Action: "auth.logout", ObjectType: "auth_session", ObjectID: principal.SessionID, Outcome: "revoked", RequestID: requestID, CreatedAt: now})
+	})
 }
 
 func RequireRole(principal Principal, roles ...domain.Role) error {
