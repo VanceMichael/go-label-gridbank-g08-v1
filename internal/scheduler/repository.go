@@ -85,10 +85,14 @@ func (Repository) Claim(ctx context.Context, q storage.Queryer, job domain.Sched
 		UPDATE compute_jobs
 		SET status = 'running', owner = ?, lease_token = ?, lease_expires_at = ?,
 		    attempt_count = attempt_count + 1, updated_at = ?, version = version + 1
-		WHERE tenant_id = ? AND id = ?`,
+		WHERE tenant_id = ? AND id = ? AND version = ?
+		  AND (status IN ('queued','retrying') OR (status = 'running' AND lease_expires_at <= ?))`,
 		workerID, token, storage.FormatTime(expiresAt), storage.FormatTime(now),
-		job.TenantID, job.ID)
+		job.TenantID, job.ID, job.Version, storage.FormatTime(now))
 	if err != nil {
+		if storage.IsBusy(err) {
+			return domain.Conflict("scheduler.claim", "scheduler_job", job.ID, "another worker is claiming the job")
+		}
 		return fmt.Errorf("claim scheduler job: %w", err)
 	}
 	changed, err := result.RowsAffected()
