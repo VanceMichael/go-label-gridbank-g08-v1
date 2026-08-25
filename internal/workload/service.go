@@ -82,9 +82,9 @@ func (s *Service) Plan(ctx context.Context, principal auth.Principal, input Plan
 				return fmt.Errorf("decode plan replay: %w", err)
 			}
 			result.Replay = true
-			if err := s.appendReplayEffects(ctx, tx, principal, input.RequestID, result.Workload.ID, now); err != nil {
-				return err
-			}
+			// Replay must be side-effect free: return the original result without
+			// re-emitting audit or outbox events, so a retried submission is not
+			// treated as a second notification by downstream schedulers.
 			return nil
 		}
 		providerValue, err := s.providers.FindProvider(ctx, tx, principal.TenantID, input.ProviderID)
@@ -387,13 +387,6 @@ func (s *Service) appendEffects(ctx context.Context, tx *sql.Tx, principal auth.
 		return fmt.Errorf("encode workload event: %w", err)
 	}
 	return s.outbox.Enqueue(ctx, tx, domain.OutboxEvent{ID: outboxID, TenantID: principal.TenantID, Topic: action, AggregateType: "workload_session", AggregateID: workloadID, Payload: string(payload), Status: domain.OutboxPending, MaxAttempts: 5, NextAttemptAt: now, CreatedAt: now, UpdatedAt: now, Version: 1})
-}
-
-func (s *Service) appendReplayEffects(ctx context.Context, tx *sql.Tx, principal auth.Principal, requestID, workloadID string, now time.Time) error {
-	if err := s.appendEffects(ctx, tx, principal, requestID, "workload.plan", workloadID, "replayed", now); err != nil {
-		return fmt.Errorf("append replay effects: %w", err)
-	}
-	return nil
 }
 
 func validatePlan(input PlanInput) error {
