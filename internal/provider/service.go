@@ -90,12 +90,9 @@ func (s *Service) CreatePool(ctx context.Context, principal auth.Principal, prov
 		if err := s.repo.InsertPool(ctx, tx, value); err != nil {
 			return err
 		}
-		return nil
+		return s.audits.Append(ctx, tx, audit.Record{ID: auditID, TenantID: principal.TenantID, ActorID: principal.UserID, Action: "pool.create", ObjectType: "compute_pool", ObjectID: value.ID, Outcome: "created", RequestID: requestID, CreatedAt: now})
 	}); err != nil {
 		return domain.ComputePool{}, fmt.Errorf("create pool: %w", err)
-	}
-	if err := s.audits.Append(ctx, s.db.SQL(), audit.Record{ID: auditID, TenantID: principal.TenantID, ActorID: principal.UserID, Action: "pool.create", ObjectType: "compute_pool", ObjectID: value.ID, Outcome: "created", RequestID: requestID, CreatedAt: now}); err != nil {
-		return domain.ComputePool{}, fmt.Errorf("create pool audit: %w", err)
 	}
 	return value, nil
 }
