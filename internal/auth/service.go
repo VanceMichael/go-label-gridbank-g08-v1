@@ -20,7 +20,7 @@ import (
 type Service struct {
 	db         *storage.Database
 	repo       Repository
-	audits     audit.Store
+	audits     audit.Auditer
 	clock      clock.Clock
 	sessionTTL time.Duration
 }
@@ -56,7 +56,16 @@ type Principal struct {
 }
 
 func NewService(db *storage.Database, c clock.Clock, sessionTTL time.Duration) *Service {
-	return &Service{db: db, repo: Repository{}, audits: audit.Store{}, clock: c, sessionTTL: sessionTTL}
+	return NewServiceWithAuditer(db, c, sessionTTL, audit.Store{})
+}
+
+// NewServiceWithAuditer lets tests inject an audit backend, e.g. one that
+// reports transient write failures so bootstrap's atomicity can be exercised.
+func NewServiceWithAuditer(db *storage.Database, c clock.Clock, sessionTTL time.Duration, audits audit.Auditer) *Service {
+	if audits == nil {
+		audits = audit.Store{}
+	}
+	return &Service{db: db, repo: Repository{}, audits: audits, clock: c, sessionTTL: sessionTTL}
 }
 
 func (s *Service) Bootstrap(ctx context.Context, input BootstrapInput) (domain.Tenant, domain.User, error) {
@@ -92,13 +101,15 @@ func (s *Service) Bootstrap(ctx context.Context, input BootstrapInput) (domain.T
 		if err := s.repo.InsertTenant(ctx, tx, tenant); err != nil {
 			return err
 		}
-		return s.repo.InsertUser(ctx, tx, user)
+		if err := s.repo.InsertUser(ctx, tx, user); err != nil {
+			return err
+		}
+		// Couple the durable audit effect to the tenant/user state in the same
+		// transaction. If the audit backend is temporarily unwritable the whole
+		// bootstrap rolls back, so no tenant or admin lingers behind a reported
+		// failure and the caller can safely retry with the same tenant name.
+		return s.audits.Append(ctx, tx, audit.Record{ID: auditID, TenantID: tenantID, ActorID: userID, Action: "tenant.bootstrap", ObjectType: "tenant", ObjectID: tenantID, Outcome: "created", RequestID: "bootstrap", CreatedAt: now})
 	})
-	if err == nil {
-		err = s.db.Write(ctx, func(tx *sql.Tx) error {
-			return s.audits.Append(ctx, tx, audit.Record{ID: auditID, TenantID: tenantID, ActorID: userID, Action: "tenant.bootstrap", ObjectType: "tenant", ObjectID: tenantID, Outcome: "created", RequestID: "bootstrap", CreatedAt: now})
-		})
-	}
 	if err != nil {
 		return domain.Tenant{}, domain.User{}, fmt.Errorf("bootstrap tenant: %w", err)
 	}

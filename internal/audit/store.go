@@ -10,6 +10,13 @@ import (
 	"github.com/VanceMichael/go-base-gridbank-g08/internal/storage"
 )
 
+// Auditer is the audit contract services depend on. The concrete Store writes
+// events inside the caller's transaction; tests can substitute a stub to
+// simulate an unwritable audit backend without touching the database layer.
+type Auditer interface {
+	Append(ctx context.Context, q storage.Queryer, record Record) error
+}
+
 type Store struct{}
 
 type Record struct {
